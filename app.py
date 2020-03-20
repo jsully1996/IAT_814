@@ -1,213 +1,186 @@
-# Import required libraries
-import pickle
-import copy
-import pathlib
+import os
+from random import randint
+
 import dash
-import math
-import datetime as dt
-import pandas as pd
-from dash.dependencies import Input, Output, State, ClientsideFunction
+import flask
+
+from dash.dependencies import Input, Output, State
 import dash_core_components as dcc
 import dash_html_components as html
 
-# Multi-dropdown options
-from controls import COUNTIES, WELL_STATUSES, WELL_TYPES, WELL_COLORS
+from pandas import read_csv, DataFrame
 
-# get relative data folder
-PATH = pathlib.Path(__file__).parent
-DATA_PATH = PATH.joinpath("data").resolve()
+### GLOBALS, DATA & INTIALISE THE APP ###
 
-app = dash.Dash(
-    __name__, meta_tags=[{"name": "viewport", "content": "width=device-width"}]
-)
-server = app.server
+# Mapbox key to display the map
+MAPBOX = 'pk.eyJ1IjoianN1bGx5MTk5NiIsImEiOiJjazdndnkxcGEwNDI1M2dsbGFyYXNkY3ZrIn0.fNTc2gRb8s3baol9xyBSjQ'
+# Make the colours consistent for each type of accident
+SEVERITY_LOOKUP = {'Fatal' : 'red',
+                    'Serious' : 'orange',
+                    'Slight' : 'yellow'}
 
-# Create controls
-county_options = [
-    {"label": str(COUNTIES[county]), "value": str(county)} for county in COUNTIES
-]
+# Need to downsample the number of Slight and Serious accidents to display them 
+# on the map. These fractions reduce the number plotted to about 10k.
+# There are only about 10k fatal accidents so don't need to downsample these
+SLIGHT_FRAC = 0.1
+SERIOUS_FRAC = 0.5
 
-well_status_options = [
-    {"label": str(WELL_STATUSES[well_status]), "value": str(well_status)}
-    for well_status in WELL_STATUSES
-]
+# This dict allows me to sort the weekdays in the right order
+DAYSORT = dict(zip(['Friday', 'Monday', 'Saturday','Sunday', 'Thursday', 'Tuesday', 'Wednesday'],
+                  [4, 0, 5, 6, 3, 1, 2]))
 
-well_type_options = [
-    {"label": str(WELL_TYPES[well_type]), "value": str(well_type)}
-    for well_type in WELL_TYPES
-]
+# Set the global font family
+FONT_FAMILY =  "Arial" 
+
+no_of_crashes = 2671
+no_of_causalties = 17891
+max_crashes_day = 'Friday'
+vul_age_group = '17-24'
+max_crash_sev = 'Slight'
+# Read in data from csv stored on github
+#csvLoc = 'accidents2015_V.csv'  
+csvLoc = 'https://raw.githubusercontent.com/richard-muir/uk-car-accidents/master/accidents2015_V.csv'
+acc = read_csv(csvLoc, index_col = 0).dropna(how='any', axis = 0)
+# Remove observations where speed limit is 0 or 10. There's only three and it adds a lot of 
+#  complexity to the bar chart for no material benefit
+acc = acc[~acc['Speed_limit'].isin([0, 10])]
+# Create an hour column
+acc['Hour'] = acc['Time'].apply(lambda x: int(x[:2]))
 
 
-# Load data
-df = pd.read_csv(DATA_PATH.joinpath("wellspublic.csv"), low_memory=False)
-df["Date_Well_Completed"] = pd.to_datetime(df["Date_Well_Completed"])
-df = df[df["Date_Well_Completed"] > dt.datetime(1960, 1, 1)]
+# Set up the Dash instance. Big thanks to @jimmybow for the boilerplate code
+server = flask.Flask(__name__)
+server.secret_key = os.environ.get('secret_key', 'secret')
+app = dash.Dash(__name__, server=server)
+app.config.suppress_callback_exceptions = True
 
-trim = df[["API_WellNo", "Well_Type", "Well_Name"]]
-trim.index = trim["API_WellNo"]
-dataset = trim.to_dict(orient="index")
+# Include the external CSS
+cssURL = ""
+app.css.append_css({
+    "external_url": cssURL
+})
 
-points = pickle.load(open(DATA_PATH.joinpath("points.pkl"), "rb"))
-
-
-# Create global chart template
-mapbox_access_token = "pk.eyJ1IjoiamFja2x1byIsImEiOiJjajNlcnh3MzEwMHZtMzNueGw3NWw5ZXF5In0.fk8k06T96Ml9CLGgKmk81w"
-
-layout = dict(
-    autosize=True,
-    automargin=True,
-    margin=dict(l=30, r=30, b=20, t=40),
-    hovermode="closest",
-    plot_bgcolor="#F9F9F9",
-    paper_bgcolor="#F9F9F9",
-    legend=dict(font=dict(size=10), orientation="h"),
-    title="Satellite Overview",
-    mapbox=dict(
-        accesstoken=mapbox_access_token,
-        style="light",
-        center=dict(lon=-78.05, lat=42.54),
-        zoom=7,
-    ),
-)
-
-# Create app layout
-app.layout = html.Div(
-    [
-        dcc.Store(id="aggregate_data"),
-        # empty Div to trigger javascript file for graph resizing
-        html.Div(id="output-clientside"),
-        html.Div(
-            [
-                html.Div(
-                    [
-                        html.Img(
-                            src=app.get_asset_url("dash-logo.png"),
-                            id="plotly-image",
-                            style={
-                                "height": "60px",
-                                "width": "auto",
-                                "margin-bottom": "25px",
-                            },
-                        )
-                    ],
-                    className="one-third column",
-                ),
-                html.Div(
-                    [
-                        html.Div(
-                            [
-                                html.H3(
-                                    "New York Oil and Gas",
-                                    style={"margin-bottom": "0px"},
-                                ),
-                                html.H5(
-                                    "Production Overview", style={"margin-top": "0px"}
-                                ),
-                            ]
-                        )
-                    ],
-                    className="one-half column",
-                    id="title",
-                ),
-                html.Div(
-                    [
-                        html.A(
-                            html.Button("Learn More", id="learn-more-button"),
-                            href="https://plot.ly/dash/pricing/",
-                        )
-                    ],
-                    className="one-third column",
-                    id="button",
-                ),
-            ],
-            id="header",
-            className="row flex-display",
-            style={"margin-bottom": "25px"},
+## SETTING UP THE APP LAYOUT ##
+app.title = 'My Title'
+# Main layout container
+app.layout = html.Div([
+    html.H1(
+        'London Road Accidents',
+        style={
+            'paddingLeft' : 50,
+            'fontFamily' : FONT_FAMILY,
+            'text-align': 'center'
+            }
         ),
-        html.Div(
-            [
-                html.Div(
+                    html.Div(
                     [
+                        html.H6("Filters",style={"text-align":"center"}),
                         html.P(
-                            "Filter by construction date (or select range in histogram):",
+                            "Filter crashes by year:",
                             className="control_label",
+                            style={'font-weight': 'bold'}
                         ),
-                        dcc.RangeSlider(
+                        dcc.Slider(
                             id="year_slider",
-                            min=1960,
-                            max=2017,
-                            value=[1990, 2010],
+                            included=False,
+                            min=2010,
+                            max=2018,
+                            value=2014,
+                            marks={str(year): str(year) for year in range(2010,2019)},
                             className="dcc_control",
                         ),
-                        html.P("Filter by well status:", className="control_label"),
-                        dcc.RadioItems(
-                            id="well_status_selector",
-                            options=[
-                                {"label": "All ", "value": "all"},
-                                {"label": "Active only ", "value": "active"},
-                                {"label": "Customize ", "value": "custom"},
-                            ],
-                            value="active",
-                            labelStyle={"display": "inline-block"},
-                            className="dcc_control",
-                        ),
+                        html.Br(),
+                        html.P("Filter by Accident Severity:", className="control_label",style={'font-weight': 'bold'}),
+                        dcc.Checklist( # Checklist for the three different severity values
+                options=[
+                    {'label': sev, 'value': sev} for sev in acc['Accident_Severity'].unique()
+                ],
+                value=[sev for sev in acc['Accident_Severity'].unique()],
+                labelStyle={
+                    'display': 'inline-block',
+                    'paddingRight' : 10,
+                    'paddingLeft' : 10,
+                    'paddingBottom' : 5,
+                    },
+                id="severityChecklist",
+                
+            ),
+                        html.Br(),
+                        html.P("   Filter by Month:", className="control_label",style={'font-weight': 'bold'}),
                         dcc.Dropdown(
                             id="well_statuses",
-                            options=well_status_options,
+                            options=[{'label': 'January', 'value': 'January'},
+                                        {'label': 'February', 'value': 'February'},
+                                        {'label': 'March', 'value': 'March'},
+                                        {'label': 'April', 'value': 'April'},
+                                        {'label': 'May', 'value': 'May'},
+                                        {'label': 'June', 'value': 'June'},
+                                        {'label': 'July', 'value': 'July'},
+                                        {'label': 'August', 'value': 'August'},
+                                        {'label': 'September', 'value': 'September'},
+                                        {'label': 'October', 'value': 'October'},
+                                        {'label': 'November', 'value': 'November'},
+                                        {'label': 'December', 'value': 'December'}],
                             multi=True,
-                            value=list(WELL_STATUSES.keys()),
+                            value=['January','February','March','April','May','June','July','August','September','October','November','December'],
                             className="dcc_control",
                         ),
-                        dcc.Checklist(
-                            id="lock_selector",
-                            options=[{"label": "Lock camera", "value": "locked"}],
-                            className="dcc_control",
-                            value=[],
-                        ),
-                        html.P("Filter by well type:", className="control_label"),
-                        dcc.RadioItems(
-                            id="well_type_selector",
-                            options=[
-                                {"label": "All ", "value": "all"},
-                                {"label": "Productive only ", "value": "productive"},
-                                {"label": "Customize ", "value": "custom"},
-                            ],
-                            value="productive",
-                            labelStyle={"display": "inline-block"},
-                            className="dcc_control",
-                        ),
-                        dcc.Dropdown(
-                            id="well_types",
-                            options=well_type_options,
-                            multi=True,
-                            value=list(WELL_TYPES.keys()),
-                            className="dcc_control",
-                        ),
+                        html.Br(),
+                        html.P("Filter by day of Week:", className="control_label",style={'font-weight': 'bold'}),
+                        dcc.Checklist( # Checklist for the dats of week, sorted using the sorting dict created earlier
+                        options=[
+                            {'label': day[:3], 'value': day} for day in sorted(acc['Day_of_Week'].unique(), key=lambda k: DAYSORT[k])
+                        ],
+                        value=[day for day in acc['Day_of_Week'].unique()],
+                        labelStyle={  # Different padding for the checklist elements
+                            'display': 'inline-block',
+                            'paddingRight' : 10,
+                            'paddingLeft' : 10,
+                            'paddingBottom' : 5,
+                            },
+                        id="dayChecklist",
+                    ),
+                        html.Br(),
+                        html.P("Filter by Hour:", className="control_label",style={'font-weight': 'bold'}),
+                        html.Br(),
+                        html.Br(),
+                    dcc.RangeSlider( # Slider to select the number of hours
+                        id="hourSlider",
+                        count=1,
+                        min=-acc['Hour'].min(),
+                        max=acc['Hour'].max(),
+                        step=1,
+                        tooltip = { 'always_visible': True },
+                        value=[acc['Hour'].min(), acc['Hour'].max()],
+                       )
                     ],
                     className="pretty_container four columns",
                     id="cross-filter-options",
                 ),
-                html.Div(
-                    [
-                        html.Div(
-                            [
+                           html.Div(                                   
+                           children= [
                                 html.Div(
-                                    [html.H6(id="well_text"), html.P("No. of Wells")],
+                                    [html.P("No. of Crashes"),html.Br(),html.H6(no_of_crashes,id="well_text")],
                                     id="wells",
-                                    className="mini_container",
+                                    className="mini_container",                                   
                                 ),
                                 html.Div(
-                                    [html.H6(id="gasText"), html.P("Gas")],
+                                    [html.P("No. of Casualties"),html.H6(no_of_causalties,id="gasText"), ],
                                     id="gas",
                                     className="mini_container",
                                 ),
                                 html.Div(
-                                    [html.H6(id="oilText"), html.P("Oil")],
+                                    [ html.P("Most Crashes on"),html.H6(max_crashes_day,id="oilText"),],
                                     id="oil",
                                     className="mini_container",
                                 ),
                                 html.Div(
-                                    [html.H6(id="waterText"), html.P("Water")],
+                                    [ html.P(['Vulnerable Age', html.Br(), 'Group']),html.H6(vul_age_group,id="oil2Text"),],
+                                    id="oil2",
+                                    className="mini_container",
+                                ),
+                                html.Div(
+                                    [ html.P("Crash Severity"),html.Br(),html.H6(max_crash_sev,id="waterText"),],
                                     id="water",
                                     className="mini_container",
                                 ),
@@ -215,496 +188,331 @@ app.layout = html.Div(
                             id="info-container",
                             className="row container-display",
                         ),
-                        html.Div(
-                            [dcc.Graph(id="count_graph")],
-                            id="countGraphContainer",
-                            className="pretty_container",
-                        ),
-                    ],
-                    id="right-column",
-                    className="eight columns",
-                ),
-            ],
-            className="row flex-display",
+ 
+        html.Div([  # Holds the map & the widgets
+
+            dcc.Graph(id="map") # Holds the map in a div to apply styling to it
+            
+        ],
+        style={
+            "width" : '63%', 
+            'display' : 'inline-block', 
+            'paddingRight' : 50, 
+            'paddingLeft' : 10,
+            'boxSizing' : 'border-box',
+            'fontFamily' : FONT_FAMILY,
+            'border-radius': '5px',
+            'background-color': '#f9f9f9',
+            'margin': '10px',
+            'padding': '15px',
+            'position': 'relative',
+            'box-shadow': '2px 2px 2px lightgrey'
+            }
+                )
+
+,
+    
+    
+    
+    
+    html.Div([  # Holds the heatmap & barchart (60:40 split) 
+        html.Div([  # Holds the heatmap
+            dcc.Graph(
+                id="heatmap",
+            ),
+        ],
+        style={
+            "width" : '60%', 
+            'float' : 'left', 
+            'display' : 'inline-block', 
+            'paddingRight' : 5, 
+            'paddingLeft' : 50,
+            'boxSizing' : 'border-box'
+            }
         ),
-        html.Div(
-            [
-                html.Div(
-                    [dcc.Graph(id="main_graph")],
-                    className="pretty_container seven columns",
-                ),
-                html.Div(
-                    [dcc.Graph(id="individual_graph")],
-                    className="pretty_container five columns",
-                ),
-            ],
-            className="row flex-display",
-        ),
-        html.Div(
-            [
-                html.Div(
-                    [dcc.Graph(id="pie_graph")],
-                    className="pretty_container seven columns",
-                ),
-                html.Div(
-                    [dcc.Graph(id="aggregate_graph")],
-                    className="pretty_container five columns",
-                ),
-            ],
-            className="row flex-display",
-        ),
-    ],
-    id="mainContainer",
-    style={"display": "flex", "flex-direction": "column"},
-)
+        html.Div([  # Holds the barchart
+            dcc.Graph(
+                id="bar",
+            )
+            #style={'height' : '50%'})
+        ],
+        style={
+            "width" : '40%', 
+            'float' : 'right', 
+            'display' : 'inline-block', 
+            'paddingRight' : 50, 
+            'paddingLeft' : 5,
+            'boxSizing' : 'border-box'
+            },
+                className="row container-display")
 
+    ])
+])
 
-# Helper functions
-def human_format(num):
-    if num == 0:
-        return "0"
+## APP INTERACTIVITY THROUGH CALLBACK FUNCTIONS TO UPDATE THE CHARTS ##
 
-    magnitude = int(math.log(num, 1000))
-    mantissa = str(int(num / (1000 ** magnitude)))
-    return mantissa + ["", "K", "M", "G", "T", "P"][magnitude]
-
-
-def filter_dataframe(df, well_statuses, well_types, year_slider):
-    dff = df[
-        df["Well_Status"].isin(well_statuses)
-        & df["Well_Type"].isin(well_types)
-        & (df["Date_Well_Completed"] > dt.datetime(year_slider[0], 1, 1))
-        & (df["Date_Well_Completed"] < dt.datetime(year_slider[1], 1, 1))
+# Callback function passes the current value of all three filters into the update functions.
+# This on updates the bar.
+@app.callback(
+    Output(component_id='bar', component_property='figure'),
+    [Input(component_id='severityChecklist', component_property='value'),
+    Input(component_id='dayChecklist', component_property='value'),
+    Input(component_id='hourSlider', component_property='value'),
     ]
-    return dff
-
-
-def produce_individual(api_well_num):
-    try:
-        points[api_well_num]
-    except:
-        return None, None, None, None
-
-    index = list(
-        range(min(points[api_well_num].keys()), max(points[api_well_num].keys()) + 1)
-    )
-    gas = []
-    oil = []
-    water = []
-
-    for year in index:
-        try:
-            gas.append(points[api_well_num][year]["Gas Produced, MCF"])
-        except:
-            gas.append(0)
-        try:
-            oil.append(points[api_well_num][year]["Oil Produced, bbl"])
-        except:
-            oil.append(0)
-        try:
-            water.append(points[api_well_num][year]["Water Produced, bbl"])
-        except:
-            water.append(0)
-
-    return index, gas, oil, water
-
-
-def produce_aggregate(selected, year_slider):
-
-    index = list(range(max(year_slider[0], 1985), 2016))
-    gas = []
-    oil = []
-    water = []
-
-    for year in index:
-        count_gas = 0
-        count_oil = 0
-        count_water = 0
-        for api_well_num in selected:
-            try:
-                count_gas += points[api_well_num][year]["Gas Produced, MCF"]
-            except:
-                pass
-            try:
-                count_oil += points[api_well_num][year]["Oil Produced, bbl"]
-            except:
-                pass
-            try:
-                count_water += points[api_well_num][year]["Water Produced, bbl"]
-            except:
-                pass
-        gas.append(count_gas)
-        oil.append(count_oil)
-        water.append(count_water)
-
-    return index, gas, oil, water
-
-
-# Create callbacks
-app.clientside_callback(
-    ClientsideFunction(namespace="clientside", function_name="resize"),
-    Output("output-clientside", "children"),
-    [Input("count_graph", "figure")],
 )
+def updateBarChart(severity, weekdays, time):
+    # The rangeslider is selects inclusively, but a python list stops before the last number in a range
+    hours = [i for i in range(time[0], time[1]+1)]
+    
+    # Create a copy of the dataframe by filtering according to the values passed in.
+    # Important to create a copy rather than affect the global object.
+    acc2 = DataFrame(acc[[
+        'Accident_Severity','Speed_limit','Number_of_Casualties']][
+            (acc['Accident_Severity'].isin(severity)) & 
+            (acc['Day_of_Week'].isin(weekdays)) & 
+            (acc['Hour'].isin(hours))
+            ].groupby(['Accident_Severity','Speed_limit']).sum()).reset_index()
 
+    # Create the field for the hovertext. Doing this after grouping, rather than
+    #  immediately after loading the df. Should be quicker this way.
+    def barText(row):
+        return 'Speed Limit: {}mph<br>{:,} {} accidents'.format(row['Speed_limit'],
+                                                                row['Number_of_Casualties'],
+                                                                row['Accident_Severity'].lower())
+    acc2['text'] = acc2.apply(barText, axis=1)
 
-@app.callback(
-    Output("aggregate_data", "data"),
-    [
-        Input("well_statuses", "value"),
-        Input("well_types", "value"),
-        Input("year_slider", "value"),
-    ],
-)
-def update_production_text(well_statuses, well_types, year_slider):
-
-    dff = filter_dataframe(df, well_statuses, well_types, year_slider)
-    selected = dff["API_WellNo"].values
-    index, gas, oil, water = produce_aggregate(selected, year_slider)
-    return [human_format(sum(gas)), human_format(sum(oil)), human_format(sum(water))]
-
-
-# Radio -> multi
-@app.callback(
-    Output("well_statuses", "value"), [Input("well_status_selector", "value")]
-)
-def display_status(selector):
-    if selector == "all":
-        return list(WELL_STATUSES.keys())
-    elif selector == "active":
-        return ["AC"]
-    return []
-
-
-# Radio -> multi
-@app.callback(Output("well_types", "value"), [Input("well_type_selector", "value")])
-def display_type(selector):
-    if selector == "all":
-        return list(WELL_TYPES.keys())
-    elif selector == "productive":
-        return ["GD", "GE", "GW", "IG", "IW", "OD", "OE", "OW"]
-    return []
-
-
-# Slider -> count graph
-@app.callback(Output("year_slider", "value"), [Input("count_graph", "selectedData")])
-def update_year_slider(count_graph_selected):
-
-    if count_graph_selected is None:
-        return [1990, 2010]
-
-    nums = [int(point["pointNumber"]) for point in count_graph_selected["points"]]
-    return [min(nums) + 1960, max(nums) + 1961]
-
-
-# Selectors -> well text
-@app.callback(
-    Output("well_text", "children"),
-    [
-        Input("well_statuses", "value"),
-        Input("well_types", "value"),
-        Input("year_slider", "value"),
-    ],
-)
-def update_well_text(well_statuses, well_types, year_slider):
-
-    dff = filter_dataframe(df, well_statuses, well_types, year_slider)
-    return dff.shape[0]
-
-
-@app.callback(
-    [
-        Output("gasText", "children"),
-        Output("oilText", "children"),
-        Output("waterText", "children"),
-    ],
-    [Input("aggregate_data", "data")],
-)
-def update_text(data):
-    return data[0] + " mcf", data[1] + " bbl", data[2] + " bbl"
-
-
-# Selectors -> main graph
-@app.callback(
-    Output("main_graph", "figure"),
-    [
-        Input("well_statuses", "value"),
-        Input("well_types", "value"),
-        Input("year_slider", "value"),
-    ],
-    [State("lock_selector", "value"), State("main_graph", "relayoutData")],
-)
-def make_main_figure(
-    well_statuses, well_types, year_slider, selector, main_graph_layout
-):
-
-    dff = filter_dataframe(df, well_statuses, well_types, year_slider)
-
+    # One trace for each accidents severity
     traces = []
-    for well_type, dfff in dff.groupby("Well_Type"):
-        trace = dict(
-            type="scattermapbox",
-            lon=dfff["Surface_Longitude"],
-            lat=dfff["Surface_latitude"],
-            text=dfff["Well_Name"],
-            customdata=dfff["API_WellNo"],
-            name=WELL_TYPES[well_type],
-            marker=dict(size=4, opacity=0.6),
-        )
-        traces.append(trace)
+    for sev in severity:
+        traces.append({
+            'type' : 'bar',
+            'y' : acc2['Number_of_Casualties'][acc2['Accident_Severity'] == sev],
+            'x' : acc2['Speed_limit'][acc2['Accident_Severity'] == sev],
+            'text' : acc2['text'][acc2['Accident_Severity'] == sev],
+            'hoverinfo' : 'text',
+            'marker' : {
+                'color' : SEVERITY_LOOKUP[sev], # Use the colur lookup for consistency
+            'line' : {'width' : 2,
+                      'color' : '#333'}},
+            'name' : sev,
+        })  
+        
+    fig = {'data' : traces,
+          'layout' : {
+              'paper_bgcolor' : '#F9F9F9',
+              'plot_bgcolor' : '#F9F9F9',
+              'font' : {
+                  'color' : '#1a1919'
+              },
+              'height' : 300,
+              'title' : 'Accidents by speed limit',
+              'margin' : { # Set margins to allow maximum space for the chart
+                  'b' : 25,
+                  'l' : 30,
+                  't' : 70,
+                  'r' : 0
+              },
+              'legend' : { # Horizontal legens, positioned at the bottom to allow maximum space for the chart
+                  'orientation' : 'h',
+                  'x' : 0,
+                  'y' : 1.01,
+                  'yanchor' : 'bottom',
+                  },
+            'xaxis' : {
+                'tickvals' : sorted(acc2['Speed_limit'].unique()), # Force the tickvals & ticktext just in case
+                'ticktext' : sorted(acc2['Speed_limit'].unique()),
+                'tickmode' : 'array'
+            },
+            'transition': {
+                'duration': 1000}
+          }}
+    
+    # Returns the figure into the 'figure' component property, update the bar chart
+    return fig
 
-    # relayoutData is None by default, and {'autosize': True} without relayout action
-    if main_graph_layout is not None and selector is not None and "locked" in selector:
-        if "mapbox.center" in main_graph_layout.keys():
-            lon = float(main_graph_layout["mapbox.center"]["lon"])
-            lat = float(main_graph_layout["mapbox.center"]["lat"])
-            zoom = float(main_graph_layout["mapbox.zoom"])
-            layout["mapbox"]["center"]["lon"] = lon
-            layout["mapbox"]["center"]["lat"] = lat
-            layout["mapbox"]["zoom"] = zoom
+# Pass in the values of the filters to the heatmap
+@app.callback(
+    Output(component_id='heatmap', component_property='figure'),
+    [Input(component_id='severityChecklist', component_property='value'),
+    Input(component_id='dayChecklist', component_property='value'),
+    Input(component_id='hourSlider', component_property='value'),
+    ]
+)
+def updateHeatmap(severity, weekdays, time):
+    # The rangeslider is selects inclusively, but a python list stops before the last number in a range
+    hours = [i for i in range(time[0], time[1] + 1)]
+    # Take a copy of the dataframe, filtering it and grouping
+    acc2 = DataFrame(acc[[
+        'Day_of_Week', 'Hour','Number_of_Casualties']][
+            (acc['Accident_Severity'].isin(severity)) & 
+            (acc['Day_of_Week'].isin(weekdays)) & 
+            (acc['Hour'].isin(hours))
+            ].groupby(['Day_of_Week', 'Hour']).sum()).reset_index()
 
-    figure = dict(data=traces, layout=layout)
-    return figure
+    # Apply text after grouping
+    def heatmapText(row):
+        return 'Day : {}<br>Time : {:02d}:00<br>Number of casualties: {}'.format(row['Day_of_Week'],
+                                                                                row['Hour'], 
+                                                                                row['Number_of_Casualties'])
+    acc2['text'] = acc2.apply(heatmapText, axis=1)
+    
+    # Pre-sort a list of days to feed into the heatmap
+    days = sorted(acc2['Day_of_Week'].unique(), key=lambda k: DAYSORT[k])
 
+    # Create the z-values and text in a nested list format to match the shape of the heatmap
+    z = []
+    text = []
+    for d in days:
+        row = acc2['Number_of_Casualties'][acc2['Day_of_Week'] == d].values.tolist()
+        t = acc2['text'][acc2['Day_of_Week'] == d].values.tolist()
+        z.append(row)
+        text.append(t)
 
-# Main graph -> individual graph
-@app.callback(Output("individual_graph", "figure"), [Input("main_graph", "hoverData")])
-def make_individual_figure(main_graph_hover):
+    # Plotly standard 'Electric' colourscale is great, but the maximum value is white, as is the
+    #  colour for missing values. I set the maximum to the penultimate maximum value, 
+    #  then spread out the other. Plotly colourscales here: https://github.com/plotly/plotly.py/blob/master/plotly/colors.py
 
-    layout_individual = copy.deepcopy(layout)
-
-    if main_graph_hover is None:
-        main_graph_hover = {
-            "points": [
-                {"curveNumber": 4, "pointNumber": 569, "customdata": 31101173130000}
-            ]
-        }
-
-    chosen = [point["customdata"] for point in main_graph_hover["points"]]
-    index, gas, oil, water = produce_individual(chosen[0])
-
-    if index is None:
-        annotation = dict(
-            text="No data available",
-            x=0.5,
-            y=0.5,
-            align="center",
-            showarrow=False,
-            xref="paper",
-            yref="paper",
-        )
-        layout_individual["annotations"] = [annotation]
-        data = []
-    else:
-        data = [
-            dict(
-                type="scatter",
-                mode="lines+markers",
-                name="Gas Produced (mcf)",
-                x=index,
-                y=gas,
-                line=dict(shape="spline", smoothing=2, width=1, color="#fac1b7"),
-                marker=dict(symbol="diamond-open"),
-            ),
-            dict(
-                type="scatter",
-                mode="lines+markers",
-                name="Oil Produced (bbl)",
-                x=index,
-                y=oil,
-                line=dict(shape="spline", smoothing=2, width=1, color="#a9bb95"),
-                marker=dict(symbol="diamond-open"),
-            ),
-            dict(
-                type="scatter",
-                mode="lines+markers",
-                name="Water Produced (bbl)",
-                x=index,
-                y=water,
-                line=dict(shape="spline", smoothing=2, width=1, color="#92d8d8"),
-                marker=dict(symbol="diamond-open"),
-            ),
+    Electric = [
+        [0, 'rgb(0,0,0)'], [0.25, 'rgb(30,0,100)'],
+        [0.55, 'rgb(120,0,100)'], [0.8, 'rgb(160,90,0)'],
+        [1, 'rgb(230,200,0)']
         ]
-        layout_individual["title"] = dataset[chosen[0]]["Well_Name"]
+    
+    # Heatmap trace
+    traces = [{
+        'type' : 'heatmap',
+        'x' : hours,
+        'y' : days,
+        'z' : z,
+        'text' : text,
+        'hoverinfo' : 'text',
+        'colorscale' : 'Viridis',
+    }]
+        
+    fig = {'data' : traces,
+          'layout' : {
+              'paper_bgcolor' : '#F9F9F9',
+              'font' : {
+                  'color' : '#1a1919'
+              },
+              'height' : 300,
+              'title' : 'Accidents by time and day',
+              'margin' : {
+                  'b' : 50,
+                  'l' : 70,
+                  't' : 50,
+                  'r' : 0,
+              },
+              'xaxis' : {
+                  'ticktext' : hours, # for the tickvals and ticktext with one for each hour
+                  'tickvals' : hours,
+                  'tickmode' : 'array', 
+              },
+              'transition': {
+                  'duration': 1000}
+          }}
+    return fig
 
-    figure = dict(data=data, layout=layout_individual)
-    return figure
-
-
-# Selectors, main graph -> aggregate graph
+# Feeds the filter outputs into the mapbox
 @app.callback(
-    Output("aggregate_graph", "figure"),
-    [
-        Input("well_statuses", "value"),
-        Input("well_types", "value"),
-        Input("year_slider", "value"),
-        Input("main_graph", "hoverData"),
-    ],
+    Output(component_id='map', component_property='figure'),
+    [Input(component_id='severityChecklist', component_property='value'),
+    Input(component_id='dayChecklist', component_property='value'),
+    Input(component_id='hourSlider', component_property='value'),
+    ]
 )
-def make_aggregate_figure(well_statuses, well_types, year_slider, main_graph_hover):
-
-    layout_aggregate = copy.deepcopy(layout)
-
-    if main_graph_hover is None:
-        main_graph_hover = {
-            "points": [
-                {"curveNumber": 4, "pointNumber": 569, "customdata": 31101173130000}
+def updateMapBox(severity, weekdays, time):
+    # List of hours again
+    hours = [i for i in range(time[0], time[1]+1)]
+    # Filter the dataframe
+    acc2 = acc[
+            (acc['Accident_Severity'].isin(severity)) &
+            (acc['Day_of_Week'].isin(weekdays)) & 
+            (acc['Hour'].isin(hours))
             ]
-        }
 
-    chosen = [point["customdata"] for point in main_graph_hover["points"]]
-    well_type = dataset[chosen[0]]["Well_Type"]
-    dff = filter_dataframe(df, well_statuses, well_types, year_slider)
-
-    selected = dff[dff["Well_Type"] == well_type]["API_WellNo"].values
-    index, gas, oil, water = produce_aggregate(selected, year_slider)
-
-    data = [
-        dict(
-            type="scatter",
-            mode="lines",
-            name="Gas Produced (mcf)",
-            x=index,
-            y=gas,
-            line=dict(shape="spline", smoothing="2", color="#F9ADA0"),
-        ),
-        dict(
-            type="scatter",
-            mode="lines",
-            name="Oil Produced (bbl)",
-            x=index,
-            y=oil,
-            line=dict(shape="spline", smoothing="2", color="#849E68"),
-        ),
-        dict(
-            type="scatter",
-            mode="lines",
-            name="Water Produced (bbl)",
-            x=index,
-            y=water,
-            line=dict(shape="spline", smoothing="2", color="#59C3C3"),
-        ),
-    ]
-    layout_aggregate["title"] = "Aggregate: " + WELL_TYPES[well_type]
-
-    figure = dict(data=data, layout=layout_aggregate)
-    return figure
-
-
-# Selectors, main graph -> pie graph
-@app.callback(
-    Output("pie_graph", "figure"),
-    [
-        Input("well_statuses", "value"),
-        Input("well_types", "value"),
-        Input("year_slider", "value"),
-    ],
-)
-def make_pie_figure(well_statuses, well_types, year_slider):
-
-    layout_pie = copy.deepcopy(layout)
-
-    dff = filter_dataframe(df, well_statuses, well_types, year_slider)
-
-    selected = dff["API_WellNo"].values
-    index, gas, oil, water = produce_aggregate(selected, year_slider)
-
-    aggregate = dff.groupby(["Well_Type"]).count()
-
-    data = [
-        dict(
-            type="pie",
-            labels=["Gas", "Oil", "Water"],
-            values=[sum(gas), sum(oil), sum(water)],
-            name="Production Breakdown",
-            text=[
-                "Total Gas Produced (mcf)",
-                "Total Oil Produced (bbl)",
-                "Total Water Produced (bbl)",
-            ],
-            hoverinfo="text+value+percent",
-            textinfo="label+percent+name",
-            hole=0.5,
-            marker=dict(colors=["#fac1b7", "#a9bb95", "#92d8d8"]),
-            domain={"x": [0, 0.45], "y": [0.2, 0.8]},
-        ),
-        dict(
-            type="pie",
-            labels=[WELL_TYPES[i] for i in aggregate.index],
-            values=aggregate["API_WellNo"],
-            name="Well Type Breakdown",
-            hoverinfo="label+text+value+percent",
-            textinfo="label+percent+name",
-            hole=0.5,
-            marker=dict(colors=[WELL_COLORS[i] for i in aggregate.index]),
-            domain={"x": [0.55, 1], "y": [0.2, 0.8]},
-        ),
-    ]
-    layout_pie["title"] = "Production Summary: {} to {}".format(
-        year_slider[0], year_slider[1]
-    )
-    layout_pie["font"] = dict(color="#777777")
-    layout_pie["legend"] = dict(
-        font=dict(color="#CCCCCC", size="10"), orientation="h", bgcolor="rgba(0,0,0,0)"
-    )
-
-    figure = dict(data=data, layout=layout_pie)
-    return figure
+    # Once trace for each severity value
+    traces = []
+    for sev in sorted(severity, reverse=True):
+        # Set the downsample fraction depending on the severity
+        sample = 1
+        if sev == 'Slight':
+            sample = SLIGHT_FRAC
+        elif sev == 'Serious':
+            sample = SERIOUS_FRAC
+        # Downsample the dataframe and filter to the current value of severity
+        acc3 = acc2[acc2['Accident_Severity'] == sev].sample(frac=sample)
+            
+        # Scattermapbox trace for each severity
+        traces.append({
+            'type' : 'scattermapbox',
+            'mode' : 'markers',
+            'lat' : acc3['Latitude'],
+            'lon' : acc3['Longitude'],
+            'marker' : {
+                'color' : SEVERITY_LOOKUP[sev], # Keep the colour consistent
+                'size' : 6.5,
+                'opacity':0.5
+            },
+            'hoverinfo' : 'text',
+            'name' : sev,
+            'legendgroup' : sev,
+            'showlegend' : False,
+            'text' : acc3['Local_Authority_(District)'] # Text will show location
+        })
+        
+        # Append a separate marker trace to show bigger markers for the legend. 
+        #  The ones we're plotting on the map are too small to be of use in the legend.
+        traces.append({
+            'type' : 'scattermapbox',
+            'mode' : 'markers',
+            'lat' : [0],
+            'lon' : [0],
+            'marker' : {
+                'color' : SEVERITY_LOOKUP[sev],
+                'size' : 10
+            },
+            'name' : sev,
+            'legendgroup' : sev,
+            
+        })
+    layout = {
+        'height' : 510,
+        'width' : 740,
+        'paper_bgcolor' : '#F9F9F9',
+              'font' : {
+                  'color' : '#1a1919'
+              }, # Set this to match the colour of the sea in the mapbox colourscheme
+        'autosize' : True,
+        'hovermode' : 'closest',
+        'mapbox' : {
+            'accesstoken' : MAPBOX,
+            'center' : {  # Set the geographic centre - trial and error
+                'lat' : 54.5,
+                'lon' : -2
+            },
+            'zoom' : 5.5,
+            'style' : 'streets',   # Dark theme will make the colours stand out
+        },
+        'margin' : {'t' : 0,
+                   'b' : 0,
+                   'l' : 0,
+                   'r' : 0},
+        'legend' : {
+            'font' : {'color' : 'black'},
+             'orientation' : 'h',
+             'x' : 0,
+             'y' : 1.01
+        },
+        'transition': {
+            'duration': 1000}
+    }
+    fig = dict(data=traces, layout=layout) 
+    return fig
 
 
-# Selectors -> count graph
-@app.callback(
-    Output("count_graph", "figure"),
-    [
-        Input("well_statuses", "value"),
-        Input("well_types", "value"),
-        Input("year_slider", "value"),
-    ],
-)
-def make_count_figure(well_statuses, well_types, year_slider):
-
-    layout_count = copy.deepcopy(layout)
-
-    dff = filter_dataframe(df, well_statuses, well_types, [1960, 2017])
-    g = dff[["API_WellNo", "Date_Well_Completed"]]
-    g.index = g["Date_Well_Completed"]
-    g = g.resample("A").count()
-
-    colors = []
-    for i in range(1960, 2018):
-        if i >= int(year_slider[0]) and i < int(year_slider[1]):
-            colors.append("rgb(123, 199, 255)")
-        else:
-            colors.append("rgba(123, 199, 255, 0.2)")
-
-    data = [
-        dict(
-            type="scatter",
-            mode="markers",
-            x=g.index,
-            y=g["API_WellNo"] / 2,
-            name="All Wells",
-            opacity=0,
-            hoverinfo="skip",
-        ),
-        dict(
-            type="bar",
-            x=g.index,
-            y=g["API_WellNo"],
-            name="All Wells",
-            marker=dict(color=colors),
-        ),
-    ]
-
-    layout_count["title"] = "Completed Wells/Year"
-    layout_count["dragmode"] = "select"
-    layout_count["showlegend"] = False
-    layout_count["autosize"] = True
-
-    figure = dict(data=data, layout=layout_count)
-    return figure
+# Run the Dash app
+if __name__ == '__main__':
+    app.server.run(debug=False, threaded=True)
 
 
-# Main
-if __name__ == "__main__":
-    app.run_server(debug=True)
